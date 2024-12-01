@@ -4,6 +4,7 @@ use std::{
     io::Read,
     os::fd::{IntoRawFd, OwnedFd},
     pipe::{PipeReader, pipe},
+    sync::{LockResult, Mutex, MutexGuard, PoisonError},
 };
 
 unsafe extern "C" {
@@ -11,23 +12,34 @@ unsafe extern "C" {
     static mut stderr: *mut libc::FILE;
 }
 
-pub fn stdout_mut() -> &'static mut *mut libc::FILE {
-    #[allow(static_mut_refs)]
-    unsafe {
-        &mut stdout
-    }
+pub struct LentFile {
+    file: &'static mut *mut libc::FILE,
+    guard: MutexGuard<'static, ()>,
 }
 
-pub fn stderr_mut() -> &'static mut *mut libc::FILE {
+pub fn stdout_mut() -> Result<LentFile, PoisonError<MutexGuard<'static, ()>>> {
+    static MUTEX: Mutex<()> = Mutex::new(());
+
     #[allow(static_mut_refs)]
-    unsafe {
-        &mut stderr
-    }
+    Ok(LentFile {
+        file: unsafe { &mut stdout },
+        guard: MUTEX.lock()?,
+    })
+}
+
+pub fn stderr_mut() -> Result<LentFile, PoisonError<MutexGuard<'static, ()>>> {
+    static MUTEX: Mutex<()> = Mutex::new(());
+
+    #[allow(static_mut_refs)]
+    Ok(LentFile {
+        file: unsafe { &mut stderr },
+        guard: MUTEX.lock()?,
+    })
 }
 
 struct SwapFile {
     swapped: *mut libc::FILE,
-    target: &'static mut *mut libc::FILE,
+    target: LentFile,
 }
 
 impl SwapFile {
@@ -35,18 +47,18 @@ impl SwapFile {
         unsafe { libc::fdopen(fd, "wb".as_bytes().as_ptr() as _) }
     }
 
-    pub fn new(fd: OwnedFd, target: &'static mut *mut libc::FILE) -> Self {
+    pub fn new(fd: OwnedFd, target: LentFile) -> Self {
         let mut file = Self::fdopen(fd.into_raw_fd());
 
-        unsafe {
-            unsafe extern "C" {
-                fn flockfile(file: *mut libc::FILE);
-            }
-
-            flockfile(file); // lock other threads
+        unsafe extern "C" {
+            fn flockfile(file: *mut libc::FILE);
         }
 
-        core::mem::swap(target, &mut file);
+        unsafe {
+            flockfile(file);
+        } // lock file to prevent other threads from writing to it
+
+        core::mem::swap(target.file, &mut file);
 
         Self {
             swapped: file,
@@ -58,7 +70,7 @@ impl SwapFile {
 impl Drop for SwapFile {
     fn drop(&mut self) {
         // restore stdout, stderr
-        core::mem::swap(self.target, &mut self.swapped);
+        core::mem::swap(self.target.file, &mut self.swapped);
 
         unsafe {
             // now, self.target points to file created at `new` method
@@ -73,13 +85,12 @@ impl Drop for SwapFile {
             // self.swapped is FILE that we created at `new` method.
             // `fd` was OwnedFd. so closing it is safe.
         }
+
+        // drop guard
     }
 }
 
-pub fn capture<F: FnOnce()>(
-    f: F,
-    target: &'static mut *mut libc::FILE,
-) -> std::io::Result<PipeReader> {
+pub fn capture<F: FnOnce()>(f: F, target: LentFile) -> std::io::Result<PipeReader> {
     let (reader, writer) = pipe()?;
 
     let swap_file = SwapFile::new(writer.into(), target);
@@ -91,10 +102,7 @@ pub fn capture<F: FnOnce()>(
     Ok(reader)
 }
 
-pub fn cap_string<F: FnOnce()>(
-    f: F,
-    target: &'static mut *mut libc::FILE,
-) -> std::io::Result<String> {
+pub fn cap_string<F: FnOnce()>(f: F, target: LentFile) -> std::io::Result<String> {
     let mut string = String::new();
     capture(f, target)?.read_to_string(&mut string)?;
 
@@ -102,9 +110,9 @@ pub fn cap_string<F: FnOnce()>(
 }
 
 pub fn cap_stdout<F: FnOnce()>(f: F) -> std::io::Result<String> {
-    cap_string(f, stdout_mut())
+    cap_string(f, stdout_mut().map_err(|_| std::io::ErrorKind::Deadlock)?)
 }
 
 pub fn cap_stderr<F: FnOnce()>(f: F) -> std::io::Result<String> {
-    cap_string(f, stderr_mut())
+    cap_string(f, stderr_mut().map_err(|_| std::io::ErrorKind::Deadlock)?)
 }
